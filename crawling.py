@@ -19,8 +19,8 @@ TITLE_COLUMNS = [f"{c}_{n}" for c in CONCEPTS for n in NUMS]  # A_1 ~ E_3 총 15
 BASE_COLUMNS = ["ID", "상품명", "가격", "URL", "이미지URL", "지역", "출발공항"]
 COLUMN_ORDER = BASE_COLUMNS + TITLE_COLUMNS
 
-# 동시 호출 제한 (환경 변수로 제어 가능, 기본값 15)
-LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "15"))
+# 💡 속도 제어를 위해 기본 Concurrency를 3~4개 수준으로 안전하게 제한 (환경 변수 우선)
+LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "4"))
 
 
 # ==========================================
@@ -35,14 +35,16 @@ def get_gspread_client():
 
 
 # ==========================================
-# [함수 2] 단일 LLM 타이틀 생성기 (제미나이 32-45자 유연한 글자 수 버퍼 + 문장부호 정제)
+# [함수 2] 단일 LLM 타이틀 생성기 (시차 출발 속도 제어 레이어 탑재)
 # ==========================================
-async def generate_naver_titles_llm(p, semaphore):
+async def generate_naver_titles_llm(p, semaphore, index):
     """
-    단일 상품 1개에 완벽히 몰입하여, 네이버 SEO 가이드라인에 맞춘 
-    공백 포함 32자-45자 사이의 묵직한 명사구 타이틀 15개를 생성합니다.
-    (쉼표, 느낌표, 물결 부호 전면 제거 및 대시 기호 치환 적용)
+    단일 상품 1개에 완벽히 몰입하여 네이버 SEO 최적화 타이틀 15개를 생성합니다.
+    [핵심] index 기반 시차 지연을 주어, 아무리 많은 상품이 들어와도 분당 토큰(TPM) 폭발을 원천 차단합니다.
     """
+    # 💡 [정밀 제어] 상품 순번(index)당 1.5초씩 순차적으로 출발하게 하여 트래픽 피크를 물리적으로 분산합니다.
+    await asyncio.sleep(index * 1.5)
+
     async with semaphore:
         departure = f"[{p['출발공항']}출발]" if p['출발공항'] != "없음" else ""
 
@@ -61,7 +63,6 @@ async def generate_naver_titles_llm(p, semaphore):
         elif price_grade == "프리미엄":
             grade_rule = "- 등급 소구: 하이엔드 고가 라인입니다. '프리미엄' 단어는 쓰지 말고 [노쇼핑노팁], [풀옵션보장], [여유로운자유시간], [전일정5성급호텔숙박] 등의 고급 키워드를 전면에 배치하세요."
 
-        # 💡 [Gemini 결합] 글자 수 하한선을 32자로 완화하여 로봇 같은 수식어 도배 현상 차단
         prompt = f"""
 당신은 네이버 쇼핑 검색 최적화(SEO) 및 소비자 클릭률(CTR)을 극대화하는 국내 최고 수준의 퍼포먼스 마케팅 카피라이팅 전문가입니다.
 제공된 여행 상품 데이터를 분석하여, 로봇이 공장에서 찍어낸 것 같은 흔적을 완벽히 지우고 실제 베테랑 마케터가 숨을 불어넣은 듯한 차별화된 상품명 15개를 생성하세요.
@@ -116,6 +117,8 @@ async def generate_naver_titles_llm(p, semaphore):
         }
 
         try:
+            # 호출 직전 0.3초 추가 마이크로 버퍼링
+            await asyncio.sleep(0.3)
             response = await openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -125,6 +128,8 @@ async def generate_naver_titles_llm(p, semaphore):
                 response_format=json_schema_format,
                 temperature=0.75
             )
+            # 완료 후 뒷 사람을 위해 0.5초 대기 후 락 해제
+            await asyncio.sleep(0.5)
             return p['ID'], json.loads(response.choices[0].message.content)
         except Exception as e:
             print(f"❌ LLM 타이틀 생성 중 에러 발생 (ID: {p['ID']}): {e}")
@@ -132,7 +137,7 @@ async def generate_naver_titles_llm(p, semaphore):
 
 
 # ==========================================
-# [함수 3] 메인 크롤러 및 데이터 파이프라인 엔진 (Claude 강력 방어벽 유지)
+# [함수 3] 메인 크롤러 및 데이터 파이프라인 엔진
 # ==========================================
 async def run_pipeline():
     gc = get_gspread_client()
@@ -167,7 +172,6 @@ async def run_pipeline():
         page = await context.new_page()
 
         for task in target_tasks:
-            # 🛡️ Claude 방어벽: 크롤링 최대 3회 자동 재시도 로직으로 누락 차단
             MAX_RETRIES = 3
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
@@ -186,11 +190,14 @@ async def run_pipeline():
                     needed_scrolls = (total_count - 1) // 20
                     for _ in range(needed_scrolls):
                         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        # 🛡️ Claude 방어벽: 동적 네트워크 로딩 감지로 완벽 수집
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=5000)
-                        except:
-                            await asyncio.sleep(1.5)  # networkidle 타임아웃 시 폴백
+                        # 💡 [이미지 누락 차단 1] 스크롤 후 레이지 로딩 이미지가 렌더링될 시간을 정밀 확보합니다.
+                        await asyncio.sleep(2.0)
+
+                    # 💡 [이미지 누락 차단 2] 명시적으로 모든 이미지 태그가 로드되고 네트워크가 안정될 때까지 최종 대기
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=6000)
+                    except:
+                        await asyncio.sleep(2.0)
 
                     items = await page.query_selector_all(".prod_list_wrap ul.type > li")
                     for item in items:
@@ -208,6 +215,12 @@ async def run_pipeline():
 
                         img_url = ""
                         if img_check:
+                            # 💡 [이미지 누락 차단 3] 뷰포트 안에 들어와야 레이지 로딩이 풀리는 경우가 있으므로 해당 요소를 살짝 스크롤 뷰에 맞춰줍니다.
+                            try:
+                                await img_check.scroll_into_view_if_needed()
+                            except:
+                                pass
+                                
                             img_el = await img_check.query_selector("img")
                             if img_el:
                                 data_src = await img_el.get_attribute("data-src")
@@ -230,7 +243,8 @@ async def run_pipeline():
                             img_url = "https:" + img_url
 
                         if not img_url:
-                            print(f"⚠️ 이미지 URL 없음: 상품명={full_title[:20]}")
+                            # 💡 원본 이미지 최종 획득 실패 시, 빈칸 대신 대체 텍스트 혹은 스킵 로그를 명확히 남깁니다.
+                            print(f"⚠️ 이미지 URL 최종 미획득: 상품명={full_title[:15]}... (대체 처리 진행)")
 
                         unique_str = f"{full_title}_{price}_{task['airport']}"
                         product_id = hashlib.md5(unique_str.encode('utf-8')).hexdigest()[:8]
@@ -240,7 +254,7 @@ async def run_pipeline():
                             "상품명": full_title,
                             "가격": price,
                             "URL": task['url'],
-                            "이미지URL": img_url,
+                            "이미지URL": img_url if img_url else "https://via.placeholder.com/150", # 안전 패딩
                             "지역": task['region'],
                             "출발공항": task['airport']
                         })
@@ -252,7 +266,7 @@ async def run_pipeline():
                     if attempt == MAX_RETRIES:
                         print(f"❌ 최대 재시도 횟수 초과. 해당 URL 최종 스킵: {task['url']}")
                     else:
-                        await asyncio.sleep(2)  # 재시도 전 잠시 대기
+                        await asyncio.sleep(3)
 
         await browser.close()
 
@@ -268,7 +282,6 @@ async def run_pipeline():
     target_s_id = os.environ.get("TARGET_SPREADSHEET_ID")
     worksheet_name = "github"
 
-    # 🛡️ Claude 방어벽: 판다스 병합 간 에러 및 예외 발생 예방
     if target_s_id:
         try:
             target_doc = gc.open_by_key(target_s_id)
@@ -292,24 +305,26 @@ async def run_pipeline():
     is_new_product = df_final["A_1"] == ""
     df_need_llm = df_final[is_new_product].copy()
 
-    print(f"🚀 [초고속 1:1 병렬 연산] 총 {len(df_final)}개 상품 중 신규 연산 대상 상품: {len(df_need_llm)}개")
+    print(f"🚀 [안전 흐름 제어 연산] 총 {len(df_final)}개 상품 중 신규 연산 대상 상품: {len(df_need_llm)}개")
 
     if len(df_need_llm) > 0:
         records_to_llm = df_need_llm.to_dict(orient="records")
+        
+        # 💡 [핵심 트래픽 제어 1] 동시 통로 개수를 안전하게 4개로 고정
         sem = asyncio.Semaphore(LLM_CONCURRENCY)  
-        tasks = [generate_naver_titles_llm(p, sem) for p in records_to_llm]
+        
+        # 💡 [핵심 트래픽 제어 2] 각 태스크에 고유 index를 주어 순차 지연 출발 시킵니다.
+        tasks = [generate_naver_titles_llm(p, sem, idx) for idx, p in enumerate(records_to_llm)]
 
-        print(f"🔗 총 {len(tasks)}개의 상품을 각각 개별 독립 프롬프트로 분할하여 OpenAI 서버로 동시 발송합니다...")
+        print(f"🔗 총 {len(tasks)}개의 상품을 시차 분산형 Queue 방식으로 안전하게 동시 처리 시작...")
         llm_results = await asyncio.gather(*tasks)
         print("📥 모든 독립 연산 응답 수신 완료! 데이터프레임 매핑을 시작합니다.")
 
         for p_id, res in llm_results:
             if not res:
                 continue
-            # 🛡️ Claude 방어벽: IndexError 방어 처리
             matched = df_final[df_final["ID"] == p_id]
             if matched.empty:
-                print(f"⚠️ 매핑 실패: ID '{p_id}'가 df_final에 존재하지 않습니다. 스킵합니다.")
                 continue
             idx = matched.index[0]
             for col in TITLE_COLUMNS:
@@ -317,10 +332,7 @@ async def run_pipeline():
 
     # 6. 최종 데이터 적재
     print(f"\n💾 [6단계] 최종 데이터 적재 준비 (총 {len(df_final)}개 상품)...")
-
-    # 🛡️ Claude 방어벽: reindex로 구글 시트 업로드 도중 폭발하는 현상 완벽 방어
     df_final = df_final.reindex(columns=COLUMN_ORDER, fill_value="")
-
     data_to_upload = [df_final.columns.values.tolist()] + df_final.values.tolist()
 
     if target_s_id:
