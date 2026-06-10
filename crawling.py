@@ -19,7 +19,7 @@ TITLE_COLUMNS = [f"{c}_{n}" for c in CONCEPTS for n in NUMS]  # A_1 ~ E_3 총 15
 BASE_COLUMNS = ["ID", "상품명", "가격", "URL", "이미지URL", "지역", "출발공항"]
 COLUMN_ORDER = BASE_COLUMNS + TITLE_COLUMNS
 
-# 💡 속도 제어를 위해 기본 Concurrency를 3~4개 수준으로 안전하게 제한 (환경 변수 우선)
+# 속도 제어를 위해 기본 Concurrency 제한
 LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "4"))
 
 
@@ -35,14 +35,10 @@ def get_gspread_client():
 
 
 # ==========================================
-# [함수 2] 단일 LLM 타이틀 생성기 (시차 출발 속도 제어 레이어 탑재)
+# [함수 2] 단일 LLM 타이틀 생성기
 # ==========================================
 async def generate_naver_titles_llm(p, semaphore, index):
-    """
-    단일 상품 1개에 완벽히 몰입하여 네이버 SEO 최적화 타이틀 15개를 생성합니다.
-    [핵심] index 기반 시차 지연을 주어, 아무리 많은 상품이 들어와도 분당 토큰(TPM) 폭발을 원천 차단합니다.
-    """
-    # 💡 [정밀 제어] 상품 순번(index)당 1.5초씩 순차적으로 출발하게 하여 트래픽 피크를 물리적으로 분산합니다.
+    # 상품 순번(index)당 시차 지연을 주어 TPM 폭발 차단
     await asyncio.sleep(index * 1.5)
 
     async with semaphore:
@@ -65,7 +61,7 @@ async def generate_naver_titles_llm(p, semaphore, index):
 
         prompt = f"""
 당신은 네이버 쇼핑 검색 최적화(SEO) 및 소비자 클릭률(CTR)을 극대화하는 국내 최고 수준의 퍼포먼스 마케팅 카피라이팅 전문가입니다.
-제공된 여행 상품 데이터를 분석하여, 로봇이 공장에서 찍어낸 것 같은 흔적을 완벽히 지우고 실제 베테랑 마케터가 숨을 불어넣은 듯한 차별화된 상품명 15개를 생성하세요.
+제공된 여행 상품 데이터를 분석하여 차별화된 상품명 15개를 생성하세요.
 
 [입력 상품 데이터]
 - 상품 식별 ID: {p['ID']}
@@ -75,23 +71,17 @@ async def generate_naver_titles_llm(p, semaphore, index):
 - 필수 출발지 문구: {departure} (이 문구가 비어있지 않다면 무조건 최종 상품명 가장 맨 앞에 고정 배치할 것)
 {grade_rule}
 
-[⚠️ 핵심 개혁: 기계적 단어 돌려막기 절대 금지]
-모든 타이틀에 "부모님 효도여행", "아이동반 가족여행", "전일정식사포함", "즐거운여행" 같은 뻔하고 상투적인 문구를 접두사처럼 고정하여 뒤에 단어만 갈아 끼우는 로봇 같은 행위를 전면 금지합니다.
-어순을 완전히 파괴하고, 마케팅 소구 단어를 다채롭게 변형하여 15개의 타이틀이 각각 완전히 다른 문장 구조를 가지도록 창조하세요.
-
-[❌ 전 콘셉트 공통 제약 가이드라인]
-1. 글자 수 제약: 모든 상품명은 공백 포함 최소 32자 ~ 최대 45자 사이로 구성한다. (45자 절대 초과 금지, 의미 없는 단어 뻥튀기로 채우지 마라)
-2. 문장부호 사용 제한 및 정제 규칙: 최종 생성되는 모든 상품명 내부에는 쉼표(,), 느낌표(!), 물결 (~), 플러스(+) 같은 부호나 특수문자를 절대 포함할 수 없다. 기간이나 범위를 표현할 때 물결 기호(ex: 5~6일)가 필요하다면 무조건 붙임표 대시 기호(ex: 5-6일)로 치환하여 작성해야 한다. 쉼표와 느낌표가 들어갈 자리는 깔끔하게 공백(띄어쓰기) 처리한다.
-3. 날것 노출 금지: '#' 기호나 해시태그 형태를 그대로 노출하지 마라. (ex: #디너크루즈 -> 로맨틱디너크루즈투어, #아티타야CC -> 아티타야CC품격라운딩)
-4. 정제성: '신상품', '특가', '대박' 같은 유치한 홍보성 접두사나 특수문자는 전면 배제한다. 최종 출력물 텍스트 내부에 "주의:", "경고:", "가이드:" 등 시스템 지시어 성격의 텍스트를 삽입하는 것을 절대 금지한다.
-5. 문장 자율성: 기계적인 명사 나열에만 집착하지 말고, 조사와 마케팅 수식어를 자연스럽게 결합하여 소비자가 읽었을 때 매력적인 '명사구' 형태로 늘려라. "행복한여행", "특별한여정" 같이 글자 수 채우기용 무의미한 콤보 수식어는 남발하지 마라.
+[⚠️ 핵심 제약 가이드라인]
+1. 글자 수 제약: 모든 상품명은 공백 포함 최소 32자 ~ 최대 45자 사이로 구성한다. (45자 절대 초과 금지)
+2. 문장부호 사용 제한: 최종 생성되는 모든 상품명 내부에는 쉼표(,), 느낌표(!), 물결 (~), 플러스(+) 같은 부호나 특수문자를 절대 포함할 수 없다. 범위는 붙임표 대시 기호(ex: 5-6일)로 치환한다.
+3. 정제성: '신상품', '특가' 같은 유치한 홍보성 단어는 전면 배제한다. "주의:", "경고:" 등 시스템 지시어 성격의 텍스트를 삽입하는 것을 절대 금지한다.
 
 [🎯 콘셉트별 마케팅 지향점]
-■ 콘셉트 A (정석 SEO형 - 3개): 핵심 지역, 일정, 주요 골프장/호텔 명사 위주의 실용적인 변형 조합. (배치 순서를 완전히 섞을 것)
-■ 콘셉트 B (타겟/상황형 - 3개): 상투적인 단어 금지. [부모님극찬휴양], [가족취향저격여행], [부부힐링기념], [골프마니아강추] 등 타겟층의 심리를 자극하는 생동감 있는 단어 배치.
-■ 콘셉트 C (혜택/USP형 - 3개): 등급에 맞는 핵심 혜택을 명사화하여 소구. (ex: 반나절자유시간확보, 미슐랭맛집투어, 전일정그린피포함 등)
-■ 콘셉트 D (감성/트렌디형 - 3개): 요즘뜨는핫플투어, 인생샷명소공략, 감성힐링스팟, 낭만가득일정 등 트렌디한 키워드를 자연스럽게 결합.
-■ 콘셉트 E (기본 대안형 - 3개): 원본 상품명이 가진 본연의 가치를 해치지 않는 선에서 네이버 쇼핑 노출 규격(32자-45자)에 맞게 세련되게 다듬은 대안.
+■ 콘셉트 A (정석 SEO형 - 3개): 핵심 지역, 일정, 주요 골프장/호텔 명사 위주의 실용적인 변형 조합.
+■ 콘셉트 B (타겟/상황형 - 3개): [부모님극찬휴양], [가족취향저격여행], [부부힐링기념] 등 타겟 심리 자극 단어 배치.
+■ 콘셉트 C (혜택/USP형 - 3개): 등급에 맞는 핵심 혜택을 명사화하여 소구. (ex: 반나절자유시간확보, 미슐랭맛집투어 등)
+■ 콘셉트 D (감성/트렌디형 - 3개): 요즘뜨는핫플투어, 인생샷명소공략, 감성힐링스팟 등 트렌디한 키워드 결합.
+■ 콘셉트 E (기본 대안형 - 3개): 원본 상품명 본연의 가치를 해치지 않는 규격 맞춤형 대안.
 
 반드시 아래 규격의 JSON 오브젝트 포맷으로만 응답하세요. 다른 설명은 전면 금지합니다.
 {{
@@ -117,7 +107,6 @@ async def generate_naver_titles_llm(p, semaphore, index):
         }
 
         try:
-            # 호출 직전 0.3초 추가 마이크로 버퍼링
             await asyncio.sleep(0.3)
             response = await openai_client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -128,7 +117,6 @@ async def generate_naver_titles_llm(p, semaphore, index):
                 response_format=json_schema_format,
                 temperature=0.75
             )
-            # 완료 후 뒷 사람을 위해 0.5초 대기 후 락 해제
             await asyncio.sleep(0.5)
             return p['ID'], json.loads(response.choices[0].message.content)
         except Exception as e:
@@ -159,8 +147,8 @@ async def run_pipeline():
 
     print(f"✅ 총 {len(target_tasks)}개의 크롤링 타겟 URL을 확보했습니다.")
 
-    # 2. URL 리스트 순회 및 전수 크롤링 (Playwright)
-    print("\n🕵️ [2단계] 전수 크롤링 및 실시간 스크롤 로딩 시작...")
+    # 2. 오리지널 코딩의 초고속 가벼운 크롤링 엔진 가동
+    print("\n🕵️ [2단계] 전수 크롤링 및 오리지널 스크롤 로딩 시작...")
     crawled_raw_products = []
 
     async with async_playwright() as p:
@@ -172,80 +160,47 @@ async def run_pipeline():
         page = await context.new_page()
 
         for task in target_tasks:
-            MAX_RETRIES = 3
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    print(f"🔄 로딩 중: {task['region']} ({task['airport']}) [시도 {attempt}/{MAX_RETRIES}]")
-                    await page.goto(task['url'], wait_until="domcontentloaded", timeout=30000)
+            try:
+                # 오리지널 방식 그대로 domcontentloaded 기조 유지
+                await page.goto(task['url'], wait_until="domcontentloaded", timeout=60000)
+                print(f"🔄 로딩 완료: {task['region']} ({task['airport']})")
 
-                    total_count = 20
+                # 오리지널 방식 그대로 딱 한 번 깔끔하게 스크롤 후 2초 대기
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(2)
+
+                final_items = await page.query_selector_all(".prod_list_wrap ul.type > li")
+                for item in final_items:
                     try:
-                        await page.wait_for_selector(".option_wrap.result .count em", timeout=5000)
-                        count_el = await page.query_selector(".option_wrap.result .count em")
-                        if count_el:
-                            total_count = int("".join(filter(str.isdigit, await count_el.inner_text())))
-                    except:
-                        pass
-
-                    needed_scrolls = (total_count - 1) // 20
-                    for _ in range(needed_scrolls):
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        # 💡 [이미지 누락 차단 1] 스크롤 후 레이지 로딩 이미지가 렌더링될 시간을 정밀 확보합니다.
-                        await asyncio.sleep(2.0)
-
-                    # 💡 [이미지 누락 차단 2] 명시적으로 모든 이미지 태그가 로드되고 네트워크가 안정될 때까지 최종 대기
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=6000)
-                    except:
-                        await asyncio.sleep(2.0)
-
-                    items = await page.query_selector_all(".prod_list_wrap ul.type > li")
-                    for item in items:
                         main_info = await item.query_selector(":scope > .inr.right")
                         img_check = await item.query_selector(":scope > .inr.img")
-                        if not main_info:
+                        
+                        if not main_info or not img_check:
                             continue
 
+                        # 1. 상품명 추출
                         title_el = await main_info.query_selector(".item_title")
                         full_title = (await title_el.inner_text()).strip() if title_el else "제목 없음"
 
+                        # 2. 가격 추출
                         price_el = await main_info.query_selector(".price")
                         price_raw = await price_el.inner_text() if price_el else "0"
                         price = int("".join(filter(str.isdigit, price_raw))) if any(c.isdigit() for c in price_raw) else 0
 
+                        # 3. 이미지 URL 추출 (렉 유발하는 scroll_into_view 제거, 오리지널 속성 추출 복구)
+                        img_el = await img_check.query_selector("img")
                         img_url = ""
-                        if img_check:
-                            # 💡 [이미지 누락 차단 3] 뷰포트 안에 들어와야 레이지 로딩이 풀리는 경우가 있으므로 해당 요소를 살짝 스크롤 뷰에 맞춰줍니다.
-                            try:
-                                await img_check.scroll_into_view_if_needed()
-                            except:
-                                pass
-                                
-                            img_el = await img_check.query_selector("img")
-                            if img_el:
-                                data_src = await img_el.get_attribute("data-src")
-                                src = await img_el.get_attribute("src")
-                                potential_url = data_src if data_src else src
-
-                                if potential_url and "bg_alpha" not in potential_url:
-                                    img_url = potential_url.strip()
-                                else:
-                                    all_imgs = await img_check.query_selector_all("img")
-                                    for im in all_imgs:
-                                        i_src = await im.get_attribute("src")
-                                        i_data = await im.get_attribute("data-src")
-                                        target_url = i_data if i_data else i_src
-                                        if target_url and "bg_alpha" not in target_url:
-                                            img_url = target_url.strip()
-                                            break
+                        if img_el:
+                            data_src = await img_el.get_attribute("data-src")
+                            src = await img_el.get_attribute("src")
+                            potential_url = data_src if data_src else src
+                            if potential_url and "bg_alpha" not in potential_url:
+                                img_url = potential_url.strip()
 
                         if img_url and img_url.startswith("//"):
                             img_url = "https:" + img_url
 
-                        if not img_url:
-                            # 💡 원본 이미지 최종 획득 실패 시, 빈칸 대신 대체 텍스트 혹은 스킵 로그를 명확히 남깁니다.
-                            print(f"⚠️ 이미지 URL 최종 미획득: 상품명={full_title[:15]}... (대체 처리 진행)")
-
+                        # 고유 ID 및 데이터 바인딩
                         unique_str = f"{full_title}_{price}_{task['airport']}"
                         product_id = hashlib.md5(unique_str.encode('utf-8')).hexdigest()[:8]
 
@@ -254,27 +209,29 @@ async def run_pipeline():
                             "상품명": full_title,
                             "가격": price,
                             "URL": task['url'],
-                            "이미지URL": img_url if img_url else "https://via.placeholder.com/150", # 안전 패딩
+                            "이미지URL": img_url if img_url else "https://via.placeholder.com/150",
                             "지역": task['region'],
                             "출발공항": task['airport']
                         })
+                    except Exception as item_err:
+                        print(f"⚠️ 개별 상품 파싱 에러 패스: {item_err}")
+                        continue
 
-                    break  # 성공 시 재시도 루프 탈출
-
-                except Exception as e:
-                    print(f"⚠️ [{attempt}/{MAX_RETRIES}] URL 예외 발생 ({task['url']}): {e}")
-                    if attempt == MAX_RETRIES:
-                        print(f"❌ 최대 재시도 횟수 초과. 해당 URL 최종 스킵: {task['url']}")
-                    else:
-                        await asyncio.sleep(3)
+            except Exception as url_err:
+                print(f"❌ {task['url']} 접속 및 파싱 에러 패스: {url_err}")
+                continue
 
         await browser.close()
 
     df_new = pd.DataFrame(crawled_raw_products)
-    print(f"✅ 크롤링 전수 완료: 현재 웹상에 살아있는 상품 총 {len(df_new)}개 수집됨.")
+    print(f"✅ 크롤링 완료: 현재 웹상에 살아있는 상품 총 {len(df_new)}개 수집됨.")
 
     # 3~5. 데이터 대조 연산
     print("\n📊 [3~5단계] 최신화 연산 진행 (중복 제거 및 마스터 정제)...")
+    if df_new.empty:
+        print("❌ 수집된 상품이 없어 파이프라인을 종료합니다.")
+        return
+
     df_final = df_new.drop_duplicates(subset=["ID"]).copy()
     for col in TITLE_COLUMNS:
         df_final[col] = ""
@@ -298,7 +255,7 @@ async def run_pipeline():
                     )
                     for col in TITLE_COLUMNS:
                         df_final[col] = df_final[col].fillna("")
-                    print("✅ [스마트 증분] 기존 적재된 15대 콘셉트 타이틀 매핑 성공 및 LLM 차단 보전 완료.")
+                    print("✅ [스마트 증분] 기존 적재된 15대 콘셉트 타이틀 매핑 성공 및 기존 연산 보전 완료.")
         except Exception as e:
             print(f"ℹ️ 기존 적재 시트 대조 패스: {e}")
 
@@ -309,11 +266,7 @@ async def run_pipeline():
 
     if len(df_need_llm) > 0:
         records_to_llm = df_need_llm.to_dict(orient="records")
-        
-        # 💡 [핵심 트래픽 제어 1] 동시 통로 개수를 안전하게 4개로 고정
         sem = asyncio.Semaphore(LLM_CONCURRENCY)  
-        
-        # 💡 [핵심 트래픽 제어 2] 각 태스크에 고유 index를 주어 순차 지연 출발 시킵니다.
         tasks = [generate_naver_titles_llm(p, sem, idx) for idx, p in enumerate(records_to_llm)]
 
         print(f"🔗 총 {len(tasks)}개의 상품을 시차 분산형 Queue 방식으로 안전하게 동시 처리 시작...")
