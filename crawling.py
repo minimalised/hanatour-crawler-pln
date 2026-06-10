@@ -2,92 +2,119 @@ import os
 import json
 import asyncio
 import hashlib
-import datetime
-import re
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from playwright.async_api import async_playwright
 from openai import AsyncOpenAI
 
-# 1. OpenAI 비동기 클라이언트 초기화
+# OpenAI 및 구글 시트 기본 설정
 openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", "YOUR_LOCAL_API_KEY"))
+SPREADSHEET_ID = "1mH51VHs4y0FgClkUBvZgw7oY3Yv7gQBA_a3um9uhX0I"
 
-async def generate_naver_titles_llm(data):
+# 총 5개 콘셉트 x 3개씩 = 총 15개 타이틀 마스터 컬럼 정의
+CONCEPTS = ['A', 'B', 'C', 'D', 'E']
+NUMS = [1, 2, 3]
+TITLE_COLUMNS = [f"{c}_{n}" for c in CONCEPTS for n in NUMS]  # A_1 ~ E_3 총 15개
+BASE_COLUMNS = ["ID", "상품명", "가격", "URL", "이미지URL", "지역", "출발공항"]
+COLUMN_ORDER = BASE_COLUMNS + TITLE_COLUMNS
+
+# 동시 호출 제한 (환경 변수로 제어 가능, 기본값 15)
+LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "15"))
+
+
+# ==========================================
+# [함수 1] 구글 시트 연동 인스턴스 생성
+# ==========================================
+def get_gspread_client():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    json_raw = os.environ.get("GOOGLE_JSON_RAW")
+    if json_raw:
+        return gspread.authorize(Credentials.from_service_account_info(json.loads(json_raw), scopes=scopes))
+    return gspread.authorize(Credentials.from_service_account_file('secrets.json', scopes=scopes))
+
+
+# ==========================================
+# [함수 2] 단일 LLM 타이틀 생성기 (제미나이 32-45자 유연한 글자 수 버퍼 + 문장부호 정제)
+# ==========================================
+async def generate_naver_titles_llm(p, semaphore):
     """
-    GPT-4o-mini를 활용하여 4가지 콘셉트별로 3개씩, 총 12개의 마케팅 최적화 상품명을 생성합니다.
-    자체 결과물 중복 발견 시 최대 3회까지 다양성을 높여 자동 재시도(Retry)합니다.
+    단일 상품 1개에 완벽히 몰입하여, 네이버 SEO 가이드라인에 맞춘 
+    공백 포함 32자-45자 사이의 묵직한 명사구 타이틀 15개를 생성합니다.
+    (쉼표, 느낌표, 물결 부호 전면 제거 및 대시 기호 치환 적용)
     """
-    if data['departure_airport'] != "없음":
-        departure_context = f"- 지정 출발공항: {data['departure_airport']} (반드시 상품명 맨 앞에 '{data['departure_airport']}' 형식으로 고정 배치할 것)"
-    else:
-        departure_context = "- 지정 출발공항: 없음 (★주의: 상품명 맨 앞에 '[기본출발]', '[기본출발지]', '[출발지없음]' 등 어떠한 출발 관련 문구도 절대 넣지 말고, 곧바로 '지역명'부터 시작할 것)"
+    async with semaphore:
+        departure = f"[{p['출발공항']}출발]" if p['출발공항'] != "없음" else ""
 
-    prompt = f"""
-당신은 네이버 쇼핑 검색 최적화(SEO) 및 소비자 심리를 꿰뚫는 초일류 퍼포먼스 마케팅 카피라이팅 전문가입니다.
-제공된 여행 상품 데이터를 바탕으로, 가이드라인을 완벽히 준수하는 4가지 서로 다른 마케팅 콘셉트의 상품명을 각각 3개씩(총 12개) 생성하세요.
+        price_grade = (
+            "세이브" if "[세이브]" in p['상품명'] else
+            "스탠다드" if "[스탠다드]" in p['상품명'] else
+            "프리미엄" if "[프리미엄]" in p['상품명'] else
+            "일반"
+        )
 
-[💎 중요: 상품 등급별 키워드 의무 반영 규칙]
-입력 데이터의 '원본 상품명'에 포함된 상품 등급별 괄호 문구를 파악하여, 생성되는 모든 상품명(A~D 전 콘셉트 공통)에 아래 키워드를 반드시 자연스럽게 녹여내세요.
-1. 원본 상품명에 '[세이브]'가 포함된 경우: 
-   - '세이브'라는 단어 자체는 쓰지 말고, 대신 [실속], [가성비추천], [합리적], [부담없는] 등 경제성과 실속을 전면 강조하는 명사 키워드를 조합하세요.
-2. 원본 상품명에 '[스탠다드]'가 포함된 경우:
-   - '스탠다드'라는 단어 대신 [핵심일정], [완벽구성], [알찬여행], [밸런스추천] 등 일정의 탄탄함과 균형 잡힌 구성을 강조하는 키워드를 조합하세요.
-3. 원본 상품명에 '[프리미엄]'이 포함된 경우:
-   - '프리미엄'이라는 단어 대신 [노쇼핑], [노팁], [노옵션], [자유시간포함], [전일정5성숙소] 등 소비자가 피로감을 느끼지 않고 가장 편안하고 고급스러운 혜택성 키워드를 전면에 배치하세요.
+        grade_rule = ""
+        if price_grade == "세이브":
+            grade_rule = "- 등급 소구: 가성비 실속 라인 플랜입니다. '세이브' 단어는 쓰지 말고 [실속형여행], [가성비추천], [합리적선택], [부담없는플랜] 등의 키워드를 카피마다 다채롭게 흩뿌리세요."
+        elif price_grade == "스탠다드":
+            grade_rule = "- 등급 소구: 표준 스탠다드 라인입니다. '스탠다드' 단어는 쓰지 말고 [핵심일정포함], [완벽구성패키지], [알찬일정여행], [밸런스추천] 등의 키워드를 흩뿌리세요."
+        elif price_grade == "프리미엄":
+            grade_rule = "- 등급 소구: 하이엔드 고가 라인입니다. '프리미엄' 단어는 쓰지 말고 [노쇼핑노팁], [풀옵션보장], [여유로운자유시간], [전일정5성급호텔숙박] 등의 고급 키워드를 전면에 배치하세요."
 
-[⚠️ 데이터 특징 및 상품 간 차별화 지침]
-현재 등록하려는 상품들은 지역명이 매우 유사합니다. 
-위의 등급별 가이드라인과 더불어 [원본 상품명] 내부에 포함된 고유 힌트 및 [핵심 설명], [추출 키워드]를 분석하여 해당 상품만의 고유 특징을 상품명에 녹여내어 다른 행의 상품들과 확실하게 차별화되도록 만드세요.
+        # 💡 [Gemini 결합] 글자 수 하한선을 32자로 완화하여 로봇 같은 수식어 도배 현상 차단
+        prompt = f"""
+당신은 네이버 쇼핑 검색 최적화(SEO) 및 소비자 클릭률(CTR)을 극대화하는 국내 최고 수준의 퍼포먼스 마케팅 카피라이팅 전문가입니다.
+제공된 여행 상품 데이터를 분석하여, 로봇이 공장에서 찍어낸 것 같은 흔적을 완벽히 지우고 실제 베테랑 마케터가 숨을 불어넣은 듯한 차별화된 상품명 15개를 생성하세요.
 
-[입력 데이터]
-- 원본 상품명: {data['full_title']}  
-- 여행 지역: {data['region']}
-- 기간: {data['duration']}
-{departure_context}
-- 핵심 설명: {data['description']}
-- 추출 키워드: {data['hashtags']}
+[입력 상품 데이터]
+- 상품 식별 ID: {p['ID']}
+- 원본 상품명: {p['상품명']}
+- 여행 지역: {p['지역']}
+- 가격/금액: {p['가격']:,}원
+- 필수 출발지 문구: {departure} (이 문구가 비어있지 않다면 무조건 최종 상품명 가장 맨 앞에 고정 배치할 것)
+{grade_rule}
 
-[❌ 전 콘셉트 공통 절대 금지 가이드라인]
-1. 글자 수: 모든 상품명은 공백 포함 최소 30자 ~ 최대 45자 사이로 구성한다. (50자 절대 초과 금지)
-2. 중복 제거: 단일 상품명 내부에서 동일한 단어(ex: 방콕, 여행, 패키지 등)가 2회 이상 중복 나열되는 것을 절대 금지한다.
-3. 정제성: '신상품', '세이브', '특가', '대박', '★' 같은 홍보성 문구나 특수문자는 절대 포함하지 않는다.
-4. 출발지 조건 규칙: [지정 출발공항]이 '없음'일 경우 '기본출발' 등을 임의로 조작하지 말고 무조건 곧바로 지역명/브랜드명으로 시작한다.
-5. 결과물 간 상호 중복 엄금: 생성되는 12개의 상품명은 조사나 어순만 바꾼 수준이 아니라 완전히 다른 키워드 조합을 가져야 한다.
+[⚠️ 핵심 개혁: 기계적 단어 돌려막기 절대 금지]
+모든 타이틀에 "부모님 효도여행", "아이동반 가족여행", "전일정식사포함", "즐거운여행" 같은 뻔하고 상투적인 문구를 접두사처럼 고정하여 뒤에 단어만 갈아 끼우는 로봇 같은 행위를 전면 금지합니다.
+어순을 완전히 파괴하고, 마케팅 소구 단어를 다채롭게 변형하여 15개의 타이틀이 각각 완전히 다른 문장 구조를 가지도록 창조하세요.
 
-[🎯 콘셉트별 상세 생성 규칙]
-■ 콘셉트 A (정석 SEO형 - 3개): 핵심 키워드 위주의 명사 나열 조합. (3개 간 키워드 배치 순서를 다르게 뒤섞을 것)
-■ 콘셉트 B (타겟/상황형 - 3개): 타겟 키워드를 3개가 각각 다르게 선택 (부모님 효도, 아이동반 등)
-■ 콘셉트 C (혜택/USP형 - 3개): 소비자가 직관적으로 이득을 느끼는 등급별 프리미엄 혜택 명사화 강조.
-■ 콘셉트 D (감성/트렌디형 - 3개): 요즘뜨는, 인생샷, 감성숙소 등 감성 단어가 겹치지 않게 분산.
+[❌ 전 콘셉트 공통 제약 가이드라인]
+1. 글자 수 제약: 모든 상품명은 공백 포함 최소 32자 ~ 최대 45자 사이로 구성한다. (45자 절대 초과 금지, 의미 없는 단어 뻥튀기로 채우지 마라)
+2. 문장부호 사용 제한 및 정제 규칙: 최종 생성되는 모든 상품명 내부에는 쉼표(,), 느낌표(!), 물결 (~), 플러스(+) 같은 부호나 특수문자를 절대 포함할 수 없다. 기간이나 범위를 표현할 때 물결 기호(ex: 5~6일)가 필요하다면 무조건 붙임표 대시 기호(ex: 5-6일)로 치환하여 작성해야 한다. 쉼표와 느낌표가 들어갈 자리는 깔끔하게 공백(띄어쓰기) 처리한다.
+3. 날것 노출 금지: '#' 기호나 해시태그 형태를 그대로 노출하지 마라. (ex: #디너크루즈 -> 로맨틱디너크루즈투어, #아티타야CC -> 아티타야CC품격라운딩)
+4. 정제성: '신상품', '특가', '대박' 같은 유치한 홍보성 접두사나 특수문자는 전면 배제한다. 최종 출력물 텍스트 내부에 "주의:", "경고:", "가이드:" 등 시스템 지시어 성격의 텍스트를 삽입하는 것을 절대 금지한다.
+5. 문장 자율성: 기계적인 명사 나열에만 집착하지 말고, 조사와 마케팅 수식어를 자연스럽게 결합하여 소비자가 읽었을 때 매력적인 '명사구' 형태로 늘려라. "행복한여행", "특별한여정" 같이 글자 수 채우기용 무의미한 콤보 수식어는 남발하지 마라.
+
+[🎯 콘셉트별 마케팅 지향점]
+■ 콘셉트 A (정석 SEO형 - 3개): 핵심 지역, 일정, 주요 골프장/호텔 명사 위주의 실용적인 변형 조합. (배치 순서를 완전히 섞을 것)
+■ 콘셉트 B (타겟/상황형 - 3개): 상투적인 단어 금지. [부모님극찬휴양], [가족취향저격여행], [부부힐링기념], [골프마니아강추] 등 타겟층의 심리를 자극하는 생동감 있는 단어 배치.
+■ 콘셉트 C (혜택/USP형 - 3개): 등급에 맞는 핵심 혜택을 명사화하여 소구. (ex: 반나절자유시간확보, 미슐랭맛집투어, 전일정그린피포함 등)
+■ 콘셉트 D (감성/트렌디형 - 3개): 요즘뜨는핫플투어, 인생샷명소공략, 감성힐링스팟, 낭만가득일정 등 트렌디한 키워드를 자연스럽게 결합.
+■ 콘셉트 E (기본 대안형 - 3개): 원본 상품명이 가진 본연의 가치를 해치지 않는 선에서 네이버 쇼핑 노출 규격(32자-45자)에 맞게 세련되게 다듬은 대안.
+
+반드시 아래 규격의 JSON 오브젝트 포맷으로만 응답하세요. 다른 설명은 전면 금지합니다.
+{{
+  "A_1": "...", "A_2": "...", "A_3": "...",
+  "B_1": "...", "B_2": "...", "B_3": "...",
+  "C_1": "...", "C_2": "...", "C_3": "...",
+  "D_1": "...", "D_2": "...", "D_3": "...",
+  "E_1": "...", "E_2": "...", "E_3": "..."
+}}
 """
-    
-    json_schema_format = {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "naver_twelve_titles_schema",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "A_1": {"type": "string"}, "A_2": {"type": "string"}, "A_3": {"type": "string"},
-                    "B_1": {"type": "string"}, "B_2": {"type": "string"}, "B_3": {"type": "string"},
-                    "C_1": {"type": "string"}, "C_2": {"type": "string"}, "C_3": {"type": "string"},
-                    "D_1": {"type": "string"}, "D_2": {"type": "string"}, "D_3": {"type": "string"}
-                },
-                "required": [
-                    "A_1", "A_2", "A_3", "B_1", "B_2", "B_3", 
-                    "C_1", "C_2", "C_3", "D_1", "D_2", "D_3"
-                ],
-                "additionalProperties": False
+        json_schema_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "naver_fifteen_titles_single_schema",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {col: {"type": "string"} for col in TITLE_COLUMNS},
+                    "required": TITLE_COLUMNS,
+                    "additionalProperties": False
+                }
             }
         }
-    }
 
-    max_retries = 3
-    current_temp = 0.4
-    
-    for attempt in range(1, max_retries + 1):
         try:
             response = await openai_client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -96,176 +123,40 @@ async def generate_naver_titles_llm(data):
                     {"role": "user", "content": prompt}
                 ],
                 response_format=json_schema_format,
-                temperature=current_temp,
-                seed=42 if attempt == 1 else None
+                temperature=0.75
             )
-            
-            res_json = json.loads(response.choices[0].message.content)
-            titles_list = [
-                res_json.get(f"{concepts}_{i}", "").strip() 
-                for concepts in ['A', 'B', 'C', 'D'] 
-                for i in [1, 2, 3]
-            ]
-            
-            unique_titles = set(titles_list)
-            if len(unique_titles) == 12:
-                return tuple(titles_list)
-            
-            current_temp += 0.15
-            
+            return p['ID'], json.loads(response.choices[0].message.content)
         except Exception as e:
-            if attempt == max_retries:
-                break
-
-    err_t = f"[Error] {data['full_title'][:15]}"
-    if 'titles_list' not in locals() or len(titles_list) < 12:
-        titles_list = [err_t] * 12
-    return tuple(titles_list)
+            print(f"❌ LLM 타이틀 생성 중 에러 발생 (ID: {p['ID']}): {e}")
+            return p['ID'], {}
 
 
-async def scrape_single_product_elements(item, target_region, target_airport, current_url, idx):
-    """
-    [1단계 전용] 외부 브라우저 대기를 없애기 위해 오직 '웹 엘리먼트 순수 크롤링'만 수행합니다.
-    """
-    try:
-        main_info = await item.query_selector(":scope > .inr.right")
-        img_check = await item.query_selector(":scope > .inr.img")
-        
-        if not main_info or not img_check:
-            return None
+# ==========================================
+# [함수 3] 메인 크롤러 및 데이터 파이프라인 엔진 (Claude 강력 방어벽 유지)
+# ==========================================
+async def run_pipeline():
+    gc = get_gspread_client()
+    doc = gc.open_by_key(SPREADSHEET_ID)
 
-        title_el = await main_info.query_selector(".item_title")
-        full_title = (await title_el.inner_text()).strip() if title_el else "제목 없음"
+    # 1. 구글 스프레드시트에서 타겟 URL 리스트 가져오기
+    print("📥 [1단계] 타겟 상품리스트 URL 로드 중...")
+    target_rows = doc.worksheet("상품리스트").get_all_values()[1:]
+    target_tasks = []
+    for r in target_rows:
+        if r and r[0].startswith("http"):
+            raw_airport = r[2].strip() if len(r) > 2 else ""
+            airport_val = raw_airport if raw_airport != "" else "없음"
+            target_tasks.append({
+                "url": r[0].strip(),
+                "region": r[1].strip(),
+                "airport": airport_val
+            })
 
-        price_el = await main_info.query_selector(".price")
-        price_raw = await price_el.inner_text() if price_el else "0"
-        price = "".join(filter(str.isdigit, price_raw))
+    print(f"✅ 총 {len(target_tasks)}개의 크롤링 타겟 URL을 확보했습니다.")
 
-        # 고유 ID 생성 (제목+가격+주소+순번)
-        unique_str = f"{full_title}_{price}_{current_url}_{idx}"
-        product_id = hashlib.md5(unique_str.encode()).hexdigest()[:8]
-
-        pure_title_body = re.sub(r'\[.*?\]', '', full_title).strip()
-        if "#" in pure_title_body:
-            parts = pure_title_body.split("#")
-            pure_title = parts[0].strip()
-            title_hashtags = sorted([p.strip() for p in parts[1:] if p.strip()])
-        else:
-            pure_title = pure_title_body
-            title_hashtags = []
-
-        hash_span_els = await main_info.query_selector_all(".hash_group span")
-        ui_hashtags = [(await h.inner_text()).replace("#", "").strip() for h in hash_span_els]
-        all_hashtags = sorted(list(set(title_hashtags + ui_hashtags)))
-
-        desc_el = await main_info.query_selector(".item_text.stit")
-        product_desc = (await desc_el.inner_text()).strip() if desc_el else ""
-
-        duration_el = await main_info.query_selector("span.icn.cal")
-        duration_text = (await duration_el.inner_text()).strip() if duration_el else ""
-        duration = duration_text.replace("여행기간", "").strip()
-
-        img_url = ""
-        img_el = await img_check.query_selector("img")
-        if img_el:
-            data_src = await img_el.get_attribute("data-src")
-            src = await img_el.get_attribute("src")
-            potential_url = data_src if data_src else src
-            
-            if potential_url and "bg_alpha" not in potential_url:
-                img_url = potential_url.strip()
-            else:
-                all_imgs = await img_check.query_selector_all("img")
-                for im in all_imgs:
-                    i_src = await im.get_attribute("src")
-                    i_data = await im.get_attribute("data-src")
-                    target = i_data if i_data else i_src
-                    if target and "bg_alpha" not in target:
-                        img_url = target.strip()
-                        break
-
-        if img_url and img_url.startswith("//"): 
-            img_url = "https:" + img_url
-
-        return {
-            "ID": product_id,
-            "원본상품명": full_title,
-            "정제상품명": pure_title,
-            "가격": int(price) if price else 0,
-            "URL": current_url,
-            "이미지URL": img_url,
-            "지정지역": target_region,
-            "출발공항": target_airport,
-            "duration": duration,
-            "description": product_desc,
-            "hashtags": ", ".join(all_hashtags)
-        }
-    except Exception as e:
-        print(f"⚠️ 개별 상품 파싱 실패 패스: {e}")
-        return None
-
-
-async def run_crawler():
-    print("🌐 구글 API 인증 및 스프레드시트 연결 중...")
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    json_raw = os.environ.get("GOOGLE_JSON_RAW")
-    
-    try:
-        if json_raw:
-            service_account_info = json.loads(json_raw)
-            creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
-        else:
-            creds = Credentials.from_service_account_file('secrets.json', scopes=scopes)
-        gc = gspread.authorize(creds)
-    except Exception as auth_error:
-        print(f"❌ 구글 API 인증 실패: {auth_error}")
-        return
-
-    # SOURCE LOAD
-    source_spreadsheet_id = os.environ.get("SOURCE_SPREADSHEET_ID")
-    try:
-        source_doc = gc.open_by_key(source_spreadsheet_id)
-        source_sheet = source_doc.worksheet("상품리스트")
-        all_rows = source_sheet.get_all_values()
-        target_tasks = []
-        for row in all_rows[1:]:
-            if len(row) >= 1 and row[0].startswith("http"):
-                target_tasks.append({
-                    "url": row[0].strip(),
-                    "sheet_region": row[1].strip() if len(row) > 1 and row[1].strip() else "지역명 미상",
-                    "sheet_airport": row[2].strip() if len(row) > 2 and row[2].strip() else "없음"
-                })
-        print(f"✅ 총 {len(target_tasks)}개의 대용량 타겟 URL 작업을 확보했습니다.")
-    except Exception as e:
-        print(f"❌ URL 리스트 가공 에러: {e}")
-        return
-
-    # TARGET 기존 마스터 캐시 LOAD
-    target_spreadsheet_id = os.environ.get("TARGET_SPREADSHEET_ID")
-    worksheet_name = "github"
-    existing_titles_dict = {}
-    
-    try:
-        target_doc = gc.open_by_key(target_spreadsheet_id)
-        github_sheet = target_doc.worksheet(worksheet_name)
-        existing_data = github_sheet.get_all_records()
-        for r in existing_data:
-            if r.get("ID"):
-                existing_titles_dict[str(r["ID"])] = [
-                    r.get("A_정석_1", ""), r.get("A_정석_2", ""), r.get("A_정석_3", ""),
-                    r.get("B_타겟_1", ""), r.get("B_타겟_2", ""), r.get("B_타겟_3", ""),
-                    r.get("C_혜택_1", ""), r.get("C_혜택_2", ""), r.get("C_혜택_3", ""),
-                    r.get("D_감성_1", ""), r.get("D_감성_2", ""), r.get("D_감성_3", "")
-                ]
-        print(f"✅ 기수집된 마스터 데이터 {len(existing_titles_dict)}개를 캐싱했습니다.")
-    except Exception as cache_error:
-        print(f"⚠️ 기존 시트 로드 패스: {cache_error}")
-
-    # =======================================================================
-    # 🌟 [1단계] 고속 웹 크롤링 스테이지 (GPT 대기 없음, 오직 순수 스크래핑만)
-    # =======================================================================
-    print("\n⚡ [STAGE 1] 전체 기획전 URL 대상 고속 웹 스크래핑을 시작합니다...")
-    raw_scraped_list = []
+    # 2. URL 리스트 순회 및 전수 크롤링 (Playwright)
+    print("\n🕵️ [2단계] 전수 크롤링 및 실시간 스크롤 로딩 시작...")
+    crawled_raw_products = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -275,146 +166,177 @@ async def run_crawler():
         )
         page = await context.new_page()
 
-        for idx, task in enumerate(target_tasks, start=1):
-            current_url = task["url"]
-            target_region = task["sheet_region"]
-            target_airport = task["sheet_airport"]
-            
-            try:
-                print(f"🔄 [{idx}/{len(target_tasks)}] {target_region} 기획전 스크래핑 중...")
-                await page.goto(current_url, wait_until="domcontentloaded", timeout=25000)
-                
+        for task in target_tasks:
+            # 🛡️ Claude 방어벽: 크롤링 최대 3회 자동 재시도 로직으로 누락 차단
+            MAX_RETRIES = 3
+            for attempt in range(1, MAX_RETRIES + 1):
                 try:
-                    await page.wait_for_selector(".option_wrap.result .count em", timeout=5000)
-                except:
-                    pass
+                    print(f"🔄 로딩 중: {task['region']} ({task['airport']}) [시도 {attempt}/{MAX_RETRIES}]")
+                    await page.goto(task['url'], wait_until="domcontentloaded", timeout=30000)
 
-                total_count = 20
-                count_element = await page.query_selector(".option_wrap.result .count em")
-                if count_element:
-                    count_text = (await count_element.inner_text()).strip()
-                    if count_text.isdigit():
-                        total_count = int(count_text)
+                    total_count = 20
+                    try:
+                        await page.wait_for_selector(".option_wrap.result .count em", timeout=5000)
+                        count_el = await page.query_selector(".option_wrap.result .count em")
+                        if count_el:
+                            total_count = int("".join(filter(str.isdigit, await count_el.inner_text())))
+                    except:
+                        pass
 
-                needed_scrolls = (total_count - 1) // 20 if total_count > 20 else 0
-                for _ in range(needed_scrolls):
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(1.2)
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight - 300)")
-                    await asyncio.sleep(0.2)
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    needed_scrolls = (total_count - 1) // 20
+                    for _ in range(needed_scrolls):
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        # 🛡️ Claude 방어벽: 동적 네트워크 로딩 감지로 완벽 수집
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=5000)
+                        except:
+                            await asyncio.sleep(1.5)  # networkidle 타임아웃 시 폴백
 
-                final_items = await page.query_selector_all(".prod_list_wrap ul.type > li")
-                
-                # 병렬 스크래핑 태스크 빌드
-                tasks = [
-                    scrape_single_product_elements(item, target_region, target_airport, current_url, i)
-                    for i, item in enumerate(final_items)
-                ]
-                batch_results = await asyncio.gather(*tasks)
-                
-                for res in batch_results:
-                    if res:
-                        raw_scraped_list.append(res)
-                        
-            except Exception as e:
-                print(f"❌ URL 패스 에러: {current_url} -> {e}")
-                continue
-                
+                    items = await page.query_selector_all(".prod_list_wrap ul.type > li")
+                    for item in items:
+                        main_info = await item.query_selector(":scope > .inr.right")
+                        img_check = await item.query_selector(":scope > .inr.img")
+                        if not main_info:
+                            continue
+
+                        title_el = await main_info.query_selector(".item_title")
+                        full_title = (await title_el.inner_text()).strip() if title_el else "제목 없음"
+
+                        price_el = await main_info.query_selector(".price")
+                        price_raw = await price_el.inner_text() if price_el else "0"
+                        price = int("".join(filter(str.isdigit, price_raw))) if any(c.isdigit() for c in price_raw) else 0
+
+                        img_url = ""
+                        if img_check:
+                            img_el = await img_check.query_selector("img")
+                            if img_el:
+                                data_src = await img_el.get_attribute("data-src")
+                                src = await img_el.get_attribute("src")
+                                potential_url = data_src if data_src else src
+
+                                if potential_url and "bg_alpha" not in potential_url:
+                                    img_url = potential_url.strip()
+                                else:
+                                    all_imgs = await img_check.query_selector_all("img")
+                                    for im in all_imgs:
+                                        i_src = await im.get_attribute("src")
+                                        i_data = await im.get_attribute("data-src")
+                                        target_url = i_data if i_data else i_src
+                                        if target_url and "bg_alpha" not in target_url:
+                                            img_url = target_url.strip()
+                                            break
+
+                        if img_url and img_url.startswith("//"):
+                            img_url = "https:" + img_url
+
+                        if not img_url:
+                            print(f"⚠️ 이미지 URL 없음: 상품명={full_title[:20]}")
+
+                        unique_str = f"{full_title}_{price}_{task['airport']}"
+                        product_id = hashlib.md5(unique_str.encode('utf-8')).hexdigest()[:8]
+
+                        crawled_raw_products.append({
+                            "ID": product_id,
+                            "상품명": full_title,
+                            "가격": price,
+                            "URL": task['url'],
+                            "이미지URL": img_url,
+                            "지역": task['region'],
+                            "출발공항": task['airport']
+                        })
+
+                    break  # 성공 시 재시도 루프 탈출
+
+                except Exception as e:
+                    print(f"⚠️ [{attempt}/{MAX_RETRIES}] URL 예외 발생 ({task['url']}): {e}")
+                    if attempt == MAX_RETRIES:
+                        print(f"❌ 최대 재시도 횟수 초과. 해당 URL 최종 스킵: {task['url']}")
+                    else:
+                        await asyncio.sleep(2)  # 재시도 전 잠시 대기
+
         await browser.close()
 
-    print(f"📦 [STAGE 1 완료] 총 {len(raw_scraped_list)}개의 웹 상품 원본 데이터를 정상 수집했습니다.")
+    df_new = pd.DataFrame(crawled_raw_products)
+    print(f"✅ 크롤링 전수 완료: 현재 웹상에 살아있는 상품 총 {len(df_new)}개 수집됨.")
 
-    # =======================================================================
-    # 🌟 [2단계 & 3단계] 데이터 병목 정제 및 세션 분리형 LLM 조립 스테이지
-    # =======================================================================
-    print("\n🤖 [STAGE 2 & 3] 기존 시트 비교 필터링 및 조건부 LLM 연산을 시작합니다...")
-    
-    final_synced_products = []
-    runtime_titles_dict = {}
-    
-    # 중복 노출 상품 대량 유입 시 'URL' 기준 1차 청소 처리
-    df_raw = pd.DataFrame(raw_scraped_list)
-    df_raw = df_raw.drop_duplicates(subset=["URL"], keep="first")
-    clean_scraped_list = df_raw.to_dict(orient="records")
-    print(f"🧹 기획전 간 중복 노출되던 상품을 제외한 [{len(clean_scraped_list)}개] 고유 상품 최종 분석 개시.")
+    # 3~5. 데이터 대조 연산
+    print("\n📊 [3~5단계] 최신화 연산 진행 (중복 제거 및 마스터 정제)...")
+    df_final = df_new.drop_duplicates(subset=["ID"]).copy()
+    for col in TITLE_COLUMNS:
+        df_final[col] = ""
 
-    for current_item in clean_scraped_list:
-        p_id = current_item["ID"]
-        f_title = current_item["원본상품명"]
-        price = current_item["가격"]
+    target_s_id = os.environ.get("TARGET_SPREADSHEET_ID")
+    worksheet_name = "github"
 
-        is_cached = False
-        titles = None
-
-        # 구글 시트에 완벽히 존재하며 공백이 없는 데이터인지 교차 체크
-        if p_id in existing_titles_dict:
-            sheet_titles = existing_titles_dict[p_id]
-            if sheet_titles and all(str(t).strip() for t in sheet_titles):
-                titles = sheet_titles
-                is_cached = True
-
-        # 동일 회차 내 런타임 ID 캐시 디펜스
-        if not is_cached and p_id in runtime_titles_dict:
-            titles = runtime_titles_dict[p_id]
-            is_cached = True
-
-        # [핵심] 기존 상품 패스 및 신규/미완성 상품만 선별하여 GPT 호출
-        if not is_cached or titles is None:
-            print(f"✨ [LLM 연산 할당] {f_title} ({price}원)")
-            ai_input_data = {
-                "full_title": f_title,
-                "region": current_item["지정지역"],
-                "departure_airport": current_item["출발공항"],
-                "duration": current_item["duration"],
-                "description": current_item["description"],
-                "hashtags": current_item["hashtags"]
-            }
-            # 등급 키워드가 적용된 최적화 카피라이터 호출
-            titles = await generate_naver_titles_llm(ai_input_data)
-            runtime_titles_dict[p_id] = titles
-            # OpenAI 가속 조절을 위한 0.1초 미세 딜레이
-            await asyncio.sleep(0.1)
-
-        # 수집 및 AI 조합 결과 최종 융합
-        final_synced_products.append({
-            "ID": p_id,
-            "원본상품명": f_title,
-            "정제상품명": current_item["정제상품명"],
-            "가격": price,
-            "URL": current_item["URL"],
-            "이미지URL": current_item["이미지URL"],
-            "지정지역": current_item["지정지역"],
-            "출발공항": current_item["출발공항"],
-            "A_정석_1": titles[0], "A_정석_2": titles[1], "A_정석_3": titles[2],
-            "B_타겟_1": titles[3], "B_타겟_2": titles[4], "B_타겟_3": titles[5],
-            "C_혜택_1": titles[6], "C_혜택_2": titles[7], "C_혜택_3": titles[8],
-            "D_감성_1": titles[9], "D_감성_2": titles[10], "D_감성_3": titles[11]
-        })
-
-    # =======================================================================
-    # 🌟 [4단계] 구글 마스터 시트 원샷 통적재 (API 할당량 429 에러 100% 차단)
-    # =======================================================================
-    if final_synced_products:
-        print("\n🚀 [STAGE 4] 구글 마스터 시트 원샷 동기화 업데이트 시작...")
+    # 🛡️ Claude 방어벽: 판다스 병합 간 에러 및 예외 발생 예방
+    if target_s_id:
         try:
-            df_final = pd.DataFrame(final_synced_products)
-            column_order = [
-                "ID", "원본상품명", "정제상품명", "가격", "URL", "이미지URL", "지정지역", "출발공항",
-                "A_정석_1", "A_정석_2", "A_정석_3", "B_타겟_1", "B_타겟_2", "B_타겟_3",
-                "C_혜택_1", "C_혜택_2", "C_혜택_3", "D_감성_1", "D_감성_2", "D_감성_3"
-            ]
-            df_final = df_final[column_order]
-            
-            data_to_upload = [df_final.columns.values.tolist()] + df_final.values.tolist()
-
-            github_sheet.clear()
-            github_sheet.update(values=data_to_upload, range_name='A1')
-            print(f"🎯 [최종 대동기화 성공] 마스터 Raw 시트 동기화 완료! (총 {len(df_final)}개 데이터 보존 및 동기화 적재)")
-
+            target_doc = gc.open_by_key(target_s_id)
+            old_records = target_doc.worksheet(worksheet_name).get_all_records()
+            if old_records:
+                df_old = pd.DataFrame(old_records)
+                if all(col in df_old.columns for col in ["ID"] + TITLE_COLUMNS):
+                    df_old_titles = df_old[["ID"] + TITLE_COLUMNS].drop_duplicates(subset=["ID"])
+                    df_final = pd.merge(
+                        df_final.drop(columns=TITLE_COLUMNS, errors='ignore'),
+                        df_old_titles,
+                        on="ID",
+                        how="left"
+                    )
+                    for col in TITLE_COLUMNS:
+                        df_final[col] = df_final[col].fillna("")
+                    print("✅ [스마트 증분] 기존 적재된 15대 콘셉트 타이틀 매핑 성공 및 LLM 차단 보전 완료.")
         except Exception as e:
-            print(f"❌ 구글 시트 마스터 적재 치명적 오류: {e}")
+            print(f"ℹ️ 기존 적재 시트 대조 패스: {e}")
+
+    is_new_product = df_final["A_1"] == ""
+    df_need_llm = df_final[is_new_product].copy()
+
+    print(f"🚀 [초고속 1:1 병렬 연산] 총 {len(df_final)}개 상품 중 신규 연산 대상 상품: {len(df_need_llm)}개")
+
+    if len(df_need_llm) > 0:
+        records_to_llm = df_need_llm.to_dict(orient="records")
+        sem = asyncio.Semaphore(LLM_CONCURRENCY)  
+        tasks = [generate_naver_titles_llm(p, sem) for p in records_to_llm]
+
+        print(f"🔗 총 {len(tasks)}개의 상품을 각각 개별 독립 프롬프트로 분할하여 OpenAI 서버로 동시 발송합니다...")
+        llm_results = await asyncio.gather(*tasks)
+        print("📥 모든 독립 연산 응답 수신 완료! 데이터프레임 매핑을 시작합니다.")
+
+        for p_id, res in llm_results:
+            if not res:
+                continue
+            # 🛡️ Claude 방어벽: IndexError 방어 처리
+            matched = df_final[df_final["ID"] == p_id]
+            if matched.empty:
+                print(f"⚠️ 매핑 실패: ID '{p_id}'가 df_final에 존재하지 않습니다. 스킵합니다.")
+                continue
+            idx = matched.index[0]
+            for col in TITLE_COLUMNS:
+                df_final.at[idx, col] = res.get(col, "[Error]").strip()
+
+    # 6. 최종 데이터 적재
+    print(f"\n💾 [6단계] 최종 데이터 적재 준비 (총 {len(df_final)}개 상품)...")
+
+    # 🛡️ Claude 방어벽: reindex로 구글 시트 업로드 도중 폭발하는 현상 완벽 방어
+    df_final = df_final.reindex(columns=COLUMN_ORDER, fill_value="")
+
+    data_to_upload = [df_final.columns.values.tolist()] + df_final.values.tolist()
+
+    if target_s_id:
+        try:
+            target_doc = gc.open_by_key(target_s_id)
+            sheet = target_doc.worksheet(worksheet_name)
+            sheet.clear()
+            sheet.update(values=data_to_upload, range_name='A1')
+            print(f"🚀 [적재 완료] Secrets 타겟 시트 [{target_doc.title}] 동기화 성공!")
+        except Exception as e:
+            print(f"❌ 시트 적재 실패 (ID: {target_s_id}): {e}")
+    else:
+        print("⚠️ [경고] TARGET_SPREADSHEET_ID 환경 변수가 설정되지 않아 구글 시트에 적재하지 못했습니다.")
+
+    print(f"\n🎉 고유 ID 기반 마스터 {len(COLUMN_ORDER)}대 컬럼 데이터 최신화 파이프라인이 정상 종료되었습니다!")
+
 
 if __name__ == "__main__":
-    async_loop = asyncio.get_event_loop()
-    async_loop.run_until_complete(run_crawler())
+    asyncio.run(run_pipeline())
