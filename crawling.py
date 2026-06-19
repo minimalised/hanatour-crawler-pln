@@ -10,12 +10,15 @@ from openai import AsyncOpenAI
 
 # OpenAI 및 구글 시트 기본 설정
 openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", "YOUR_LOCAL_API_KEY"))
-SPREADSHEET_ID = "1mH51VHs4y0FgClkUBvZgw7oY3Yv7gQBA_a3um9uhX0I"
 
-# 총 5개 콘셉트 x 3개씩 = 총 15개 타이틀 마스터 컬럼 정의
+# [수정] 하드코딩된 스프레드시트 ID를 환경 변수 처리 (없을 경우 기존 ID를 폴백으로 유지하거나 에러 처리 가능)
+SOURCE_SPREADSHEET_ID = os.environ.get("SOURCE_SPREADSHEET_ID", "1mH51VHs4y0FgClkUBvZgw7oY3Yv7gQBA_a3um9uhX0I")
+TARGET_SPREADSHEET_ID = os.environ.get("TARGET_SPREADSHEET_ID")
+
+# [수정] 총 5개 콘셉트 x 1개씩 = 총 5개 타이틀 마스터 컬럼 정의
 CONCEPTS = ['A', 'B', 'C', 'D', 'E']
-NUMS = [1, 2, 3]
-TITLE_COLUMNS = [f"{c}_{n}" for c in CONCEPTS for n in NUMS]  # A_1 ~ E_3 총 15개
+NUMS = [1]
+TITLE_COLUMNS = [f"{c}_{n}" for c in CONCEPTS for n in NUMS]  # A_1 ~ E_1 총 5개
 BASE_COLUMNS = ["ID", "상품명", "가격", "URL", "이미지URL", "지역", "출발공항"]
 COLUMN_ORDER = BASE_COLUMNS + TITLE_COLUMNS
 
@@ -59,9 +62,10 @@ async def generate_naver_titles_llm(p, semaphore, index):
         elif price_grade == "프리미엄":
             grade_rule = "- 등급 소구: 하이엔드 고가 라인입니다. '프리미엄' 단어는 쓰지 말고 [노쇼핑노팁], [풀옵션보장], [여유로운자유시간], [전일정5성급호텔숙박] 등의 고급 키워드를 전면에 배치하세요."
 
+        # [수정] 15개 생성에서 5개 생성(각 콘셉트별 1개)으로 프롬프트 가이드 수정
         prompt = f"""
 당신은 네이버 쇼핑 검색 최적화(SEO) 및 소비자 클릭률(CTR)을 극대화하는 국내 최고 수준의 퍼포먼스 마케팅 카피라이팅 전문가입니다.
-제공된 여행 상품 데이터를 분석하여 차별화된 상품명 15개를 생성하세요.
+제공된 여행 상품 데이터를 분석하여 차별화된 상품명 5개를 생성하세요.
 
 [입력 상품 데이터]
 - 상품 식별 ID: {p['ID']}
@@ -77,25 +81,25 @@ async def generate_naver_titles_llm(p, semaphore, index):
 3. 정제성: '신상품', '특가' 같은 유치한 홍보성 단어는 전면 배제한다. "주의:", "경고:" 등 시스템 지시어 성격의 텍스트를 삽입하는 것을 절대 금지한다.
 
 [🎯 콘셉트별 마케팅 지향점]
-■ 콘셉트 A (정석 SEO형 - 3개): 핵심 지역, 일정, 주요 골프장/호텔 명사 위주의 실용적인 변형 조합.
-■ 콘셉트 B (타겟/상황형 - 3개): [부모님극찬휴양], [가족취향저격여행], [부부힐링기념] 등 타겟 심리 자극 단어 배치.
-■ 콘셉트 C (혜택/USP형 - 3개): 등급에 맞는 핵심 혜택을 명사화하여 소구. (ex: 반나절자유시간확보, 미슐랭맛집투어 등)
-■ 콘셉트 D (감성/트렌디형 - 3개): 요즘뜨는핫플투어, 인생샷명소공략, 감성힐링스팟 등 트렌디한 키워드 결합.
-■ 콘셉트 E (기본 대안형 - 3개): 원본 상품명 본연의 가치를 해치지 않는 규격 맞춤형 대안.
+■ 콘셉트 A (정석 SEO형 - 1개): 핵심 지역, 일정, 주요 골프장/호텔 명사 위주의 실용적인 변형 조합.
+■ 콘셉트 B (타겟/상황형 - 1개): [부모님극찬휴양], [가족취향저격여행], [부부힐링기념] 등 타겟 심리 자극 단어 배치.
+■ 콘셉트 C (혜택/USP형 - 1개): 등급에 맞는 핵심 혜택을 명사화하여 소구. (ex: 반나절자유시간확보, 미슐랭맛집투어 등)
+■ 콘셉트 D (감성/트렌디형 - 1개): 요즘뜨는핫플투어, 인생샷명소공략, 감성힐링스팟 등 트렌디한 키워드 결합.
+■ 콘셉트 E (기본 대안형 - 1개): 원본 상품명 본연의 가치를 해치지 않는 규격 맞춤형 대안.
 
 반드시 아래 규격의 JSON 오브젝트 포맷으로만 응답하세요. 다른 설명은 전면 금지합니다.
 {{
-  "A_1": "...", "A_2": "...", "A_3": "...",
-  "B_1": "...", "B_2": "...", "B_3": "...",
-  "C_1": "...", "C_2": "...", "C_3": "...",
-  "D_1": "...", "D_2": "...", "D_3": "...",
-  "E_1": "...", "E_2": "...", "E_3": "..."
+  "A_1": "...",
+  "B_1": "...",
+  "C_1": "...",
+  "D_1": "...",
+  "E_1": "..."
 }}
 """
         json_schema_format = {
             "type": "json_schema",
             "json_schema": {
-                "name": "naver_fifteen_titles_single_schema",
+                "name": "naver_five_titles_single_schema",
                 "strict": True,
                 "schema": {
                     "type": "object",
@@ -129,7 +133,13 @@ async def generate_naver_titles_llm(p, semaphore, index):
 # ==========================================
 async def run_pipeline():
     gc = get_gspread_client()
-    doc = gc.open_by_key(SPREADSHEET_ID)
+    
+    # [수정] 숨김 처리된 타겟 URL 리스트 시트 ID 로드
+    if not SOURCE_SPREADSHEET_ID:
+        print("❌ SOURCE_SPREADSHEET_ID 환경 변수가 설정되지 않아 파이프라인을 시작할 수 없습니다.")
+        return
+        
+    doc = gc.open_by_key(SOURCE_SPREADSHEET_ID)
 
     # 1. 구글 스프레드시트에서 타겟 URL 리스트 가져오기
     print("📥 [1단계] 타겟 상품리스트 URL 로드 중...")
@@ -161,11 +171,9 @@ async def run_pipeline():
 
         for task in target_tasks:
             try:
-                # 오리지널 방식 그대로 domcontentloaded 기조 유지
                 await page.goto(task['url'], wait_until="domcontentloaded", timeout=60000)
                 print(f"🔄 로딩 완료: {task['region']} ({task['airport']})")
 
-                # 오리지널 방식 그대로 딱 한 번 깔끔하게 스크롤 후 2초 대기
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(2)
 
@@ -187,7 +195,7 @@ async def run_pipeline():
                         price_raw = await price_el.inner_text() if price_el else "0"
                         price = int("".join(filter(str.isdigit, price_raw))) if any(c.isdigit() for c in price_raw) else 0
 
-                        # 3. 이미지 URL 추출 (렉 유발하는 scroll_into_view 제거, 오리지널 속성 추출 복구)
+                        # 3. 이미지 URL 추출
                         img_el = await img_check.query_selector("img")
                         img_url = ""
                         if img_el:
@@ -236,12 +244,11 @@ async def run_pipeline():
     for col in TITLE_COLUMNS:
         df_final[col] = ""
 
-    target_s_id = os.environ.get("TARGET_SPREADSHEET_ID")
     worksheet_name = "github"
 
-    if target_s_id:
+    if TARGET_SPREADSHEET_ID:
         try:
-            target_doc = gc.open_by_key(target_s_id)
+            target_doc = gc.open_by_key(TARGET_SPREADSHEET_ID)
             old_records = target_doc.worksheet(worksheet_name).get_all_records()
             if old_records:
                 df_old = pd.DataFrame(old_records)
@@ -255,7 +262,7 @@ async def run_pipeline():
                     )
                     for col in TITLE_COLUMNS:
                         df_final[col] = df_final[col].fillna("")
-                    print("✅ [스마트 증분] 기존 적재된 15대 콘셉트 타이틀 매핑 성공 및 기존 연산 보전 완료.")
+                    print("✅ [스마트 증분] 기존 적재된 5대 콘셉트 타이틀 매핑 성공 및 기존 연산 보전 완료.")
         except Exception as e:
             print(f"ℹ️ 기존 적재 시트 대조 패스: {e}")
 
@@ -288,15 +295,15 @@ async def run_pipeline():
     df_final = df_final.reindex(columns=COLUMN_ORDER, fill_value="")
     data_to_upload = [df_final.columns.values.tolist()] + df_final.values.tolist()
 
-    if target_s_id:
+    if TARGET_SPREADSHEET_ID:
         try:
-            target_doc = gc.open_by_key(target_s_id)
+            target_doc = gc.open_by_key(TARGET_SPREADSHEET_ID)
             sheet = target_doc.worksheet(worksheet_name)
             sheet.clear()
             sheet.update(values=data_to_upload, range_name='A1')
             print(f"🚀 [적재 완료] Secrets 타겟 시트 [{target_doc.title}] 동기화 성공!")
         except Exception as e:
-            print(f"❌ 시트 적재 실패 (ID: {target_s_id}): {e}")
+            print(f"❌ 시트 적재 실패 (ID: {TARGET_SPREADSHEET_ID}): {e}")
     else:
         print("⚠️ [경고] TARGET_SPREADSHEET_ID 환경 변수가 설정되지 않아 구글 시트에 적재하지 못했습니다.")
 
