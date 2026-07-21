@@ -11,7 +11,7 @@ from openai import AsyncOpenAI
 # OpenAI 및 구글 시트 기본 설정
 openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", "YOUR_LOCAL_API_KEY"))
 
-SOURCE_SPREADSHEET_ID = os.environ.get("SOURCE_SPREADSHEET_ID")
+SOURCE_SPREADSHEET_ID = os.environ.get("SOURCE_SPREADSHEET_ID", "1mH51VHs4y0FgClkUBvZgw7oY3Yv7gQBA_a3um9uhX0I")
 TARGET_SPREADSHEET_ID = os.environ.get("TARGET_SPREADSHEET_ID")
 
 CONCEPTS = ['A', 'B', 'C', 'D', 'E']
@@ -35,19 +35,17 @@ def get_gspread_client():
 
 
 # ==========================================
-# [함수 2] 출발지 환각(서울출발) 완벽 차단 LLM 타이틀 생성기
+# [함수 2] 출발지 환각 차단 & 상위 랭크 기반 LLM 타이틀 생성기
 # ==========================================
 async def generate_naver_titles_llm(p, semaphore, index):
     await asyncio.sleep(index * 1.2)
 
     async with semaphore:
-        # [수정] 출발 공항 검증 및 예외 처리 강화
         raw_airport = p.get('출발공항', '').strip()
         
         if not raw_airport or raw_airport == "없음":
             departure = ""
         else:
-            # 인천/김포/부산/대구 등 정식 공항명 표기 유지
             departure = f"[{raw_airport}출발] "
 
         prompt = f"""
@@ -85,7 +83,7 @@ async def generate_naver_titles_llm(p, semaphore, index):
   "E_1": "직항 프리미엄 [대구출발] 백두산 3박4일 5성급 호텔 VIP 천지 투어"
 }}
 
-■ 예시 2 (수도권/인천 출발 또는 출발지 미지정)
+■ 예시 2 (인천/김포 또는 출발지 미지정)
 - 필수 출발지 문구: "[인천출발] " 또는 ""
 - 원본 상품명: "방콕 파타야 5일 #5성호텔 #니모섬스노클링"
 {{
@@ -97,7 +95,7 @@ async def generate_naver_titles_llm(p, semaphore, index):
 }}
 
 [⚠️ 출발지 금지 규칙 및 핵심 가이드라인]
-1. 🛑 **'서울출발' 단어 절대 사용 금지**: 항공/패키지는 서울역이나 서울시내 출발이 존재하지 않으므로 '[서울출발]', '서울출발'이라는 단어는 절대로 생성하지 마십시오. (인천, 김포, 대구, 부산 등 지정된 출발 공항명만 사용)
+1. 🛑 **'서울출발' 단어 절대 사용 금지**: '[서울출발]', '서울출발'이라는 문구는 절대로 생성하지 마십시오. (인천, 김포, 대구, 부산 등 지정된 공항명만 허용)
 2. 출발지 입력값이 빈칸("")인 경우, 출발지 관련 브라켓 문구 자체를 아예 생략하고 지역명부터 시작하십시오.
 3. 글자 수 제약: 모든 문장은 공백 포함 반드시 32자 이상 ~ 42자 이하로 작성하십시오.
 4. 기호 제한: 쉼표(,), 느낌표(!), 해시태그(#) 등 특수문자 전면 금지.
@@ -133,7 +131,7 @@ async def generate_naver_titles_llm(p, semaphore, index):
                     {"role": "user", "content": prompt}
                 ],
                 response_format=json_schema_format,
-                temperature=0.3  # 규격 준수를 위해 온도 살짝 하향
+                temperature=0.3
             )
             return p['ID'], json.loads(response.choices[0].message.content)
         except Exception as e:
@@ -244,34 +242,32 @@ async def run_pipeline():
         df_final[col] = ""
 
     # =================================================================
-    # 3. [토큰 절약 핵심] '저장된상품' 시트 연동 및 캐싱 알고리즘
+    # 3. '저장된상품' 시트 연동 및 캐싱 알고리즘 (안정성 보강)
     # =================================================================
-    print("\n💰 [3단계] '저장된상품' 캐시 시트 대조 (LLM 토큰 절감 프로세스)...")
+    print("\n💰 [3단계] '저장된상품' 캐시 시트 연동 중...")
     cached_sheet_name = "저장된상품"
     github_sheet_name = "github"
     df_cached = pd.DataFrame()
+    cached_ws = None
 
     if TARGET_SPREADSHEET_ID:
         try:
             target_doc = gc.open_by_key(TARGET_SPREADSHEET_ID)
-            
-            # '저장된상품' 시트 존재 여부 확인 및 생성
             sheet_list = [s.title for s in target_doc.worksheets()]
+            
             if cached_sheet_name not in sheet_list:
-                cached_ws = target_doc.add_worksheet(title=cached_sheet_name, rows=1000, cols=20)
-                cached_ws.append_row(COLUMN_ORDER)
-                print(f"✨ [{cached_sheet_name}] 시트가 생성되었습니다.")
+                cached_ws = target_doc.add_worksheet(title=cached_sheet_name, rows=2000, cols=20)
+                cached_ws.update(values=[COLUMN_ORDER], range_name='A1')
+                print(f"✨ [{cached_sheet_name}] 시트 새로 생성 완료!")
             else:
                 cached_ws = target_doc.worksheet(cached_sheet_name)
-                cached_records = cached_ws.get_all_records()
-                if cached_records:
-                    df_cached = pd.DataFrame(cached_records)
+                cached_values = cached_ws.get_all_values()
+                if len(cached_values) > 1:
+                    df_cached = pd.DataFrame(cached_values[1:], columns=cached_values[0])
 
-            # 캐시 데이터가 유효하면 ID 매핑을 통해 기존 A_1~E_1 타이틀 복사
+            # 기존 캐시 데이터가 존재하면 ID 기준으로 카피 복사
             if not df_cached.empty and all(col in df_cached.columns for col in ["ID"] + TITLE_COLUMNS):
                 df_cache_map = df_cached[["ID"] + TITLE_COLUMNS].drop_duplicates(subset=["ID"])
-                
-                # 비어있지 않은 실제 생성된 데이터만 필터링
                 valid_cache = df_cache_map[df_cache_map["A_1"].str.strip() != ""]
                 
                 df_final = pd.merge(
@@ -284,17 +280,16 @@ async def run_pipeline():
                     df_final[col] = df_final[col].fillna("")
                 
                 saved_count = (df_final["A_1"] != "").sum()
-                print(f"💡 [캐시 재활용 성공] 총 {len(df_final)}개 상품 중 {saved_count}개는 '저장된상품' 시트에서 재사용 (토큰 100% 절감!)")
+                print(f"💡 [캐시 재활용 성공] 총 {len(df_final)}개 상품 중 {saved_count}개는 '저장된상품' 시트에서 재사용")
         except Exception as e:
-            print(f"⚠️ 저장된상품 시트 연동 중 참조 에러: {e}")
+            print(f"⚠️ 저장된상품 시트 불러오기 중 오류: {e}")
 
-    # LLM 생성이 꼭 필요한 신규 상품만 필터링
+    # 4. 신규 상품 LLM 연산
     is_need_llm = df_final["A_1"] == ""
     df_need_llm = df_final[is_need_llm].copy()
 
-    print(f"🚀 [최종 연산 대상] 신규 LLM 타이틀 생성 필요 상품: {len(df_need_llm)}개")
+    print(f"🚀 [신규 연산 대상] 총 {len(df_final)}개 중 LLM 연산 필요: {len(df_need_llm)}개")
 
-    # 4. 신규 상품에 대해서만 LLM 호출
     if len(df_need_llm) > 0:
         records_to_llm = df_need_llm.to_dict(orient="records")
         sem = asyncio.Semaphore(LLM_CONCURRENCY)  
@@ -303,7 +298,6 @@ async def run_pipeline():
         print(f"🔗 신규 {len(tasks)}개 상품 LLM 연산 시작...")
         llm_results = await asyncio.gather(*tasks)
 
-        new_llm_rows = []
         for p_id, res in llm_results:
             if not res:
                 continue
@@ -314,21 +308,32 @@ async def run_pipeline():
             for col in TITLE_COLUMNS:
                 df_final.at[idx, col] = res.get(col, "").strip()
 
-            # 신규로 연산된 Row는 '저장된상품' 캐시 시트에 누적 적재할 준비
-            updated_row = df_final.loc[idx].reindex(COLUMN_ORDER, fill_value="").tolist()
-            new_llm_rows.append(updated_row)
+    # =================================================================
+    # 5. '저장된상품' 시트에 전체 마스터 누적 및 업데이트 (강력 보장 방식)
+    # =================================================================
+    if TARGET_SPREADSHEET_ID and cached_ws:
+        try:
+            print(f"\n💾 [4단계] [{cached_sheet_name}] 시트에 누적 업데이트 중...")
+            
+            # 기존 캐시와 현재 수집된 데이터를 합쳐 중복 제거한 최신 마스터 생성
+            df_final_to_cache = df_final.reindex(columns=COLUMN_ORDER, fill_value="")
+            
+            if not df_cached.empty and all(col in df_cached.columns for col in COLUMN_ORDER):
+                df_combined = pd.concat([df_cached, df_final_to_cache], ignore_index=True)
+                df_combined = df_combined.drop_duplicates(subset=["ID"], keep='last')
+            else:
+                df_combined = df_final_to_cache
 
-        # '저장된상품' 시트에 새 연산 결과 추가(Append)
-        if TARGET_SPREADSHEET_ID and new_llm_rows:
-            try:
-                cached_ws = gc.open_by_key(TARGET_SPREADSHEET_ID).worksheet(cached_sheet_name)
-                cached_ws.append_rows(new_llm_rows)
-                print(f"💾 [캐시 저장 완료] 신규 연산된 {len(new_llm_rows)}개 상품이 [{cached_sheet_name}] 시트에 누적 저장되었습니다.")
-            except Exception as e:
-                print(f"❌ 캐시 저장 중 에러: {e}")
+            # A1부터 깔끔하게 전체 업데이트
+            all_cache_data = [COLUMN_ORDER] + df_combined.values.tolist()
+            cached_ws.clear()
+            cached_ws.update(values=all_cache_data, range_name='A1')
+            print(f"✅ [{cached_sheet_name}] 시트에 총 {len(df_combined)}개 상품의 데이터가 성공적으로 적재되었습니다!")
+        except Exception as e:
+            print(f"❌ [{cached_sheet_name}] 시트 저장 실패: {e}")
 
-    # 5. 최종 데이터 'github' 시트 동기화 (현재 살아있는 상품 리스트)
-    print(f"\n💾 [5단계] github 출력 시트 업데이트 중...")
+    # 6. 'github' 시트 동기화 (현재 살아있는 상품들만 출력)
+    print(f"\n💾 [5단계] [{github_sheet_name}] 출력 시트 동기화 중...")
     df_final = df_final.reindex(columns=COLUMN_ORDER, fill_value="")
     data_to_upload = [df_final.columns.values.tolist()] + df_final.values.tolist()
 
@@ -338,11 +343,11 @@ async def run_pipeline():
             sheet = target_doc.worksheet(github_sheet_name)
             sheet.clear()
             sheet.update(values=data_to_upload, range_name='A1')
-            print(f"🚀 [적재 완료] [{github_sheet_name}] 시트 동기화 완료!")
+            print(f"🚀 [적재 완료] [{github_sheet_name}] 시트 동기화 성공!")
         except Exception as e:
-            print(f"❌ github 시트 적재 실패: {e}")
+            print(f"❌ [{github_sheet_name}] 시트 적재 실패: {e}")
 
-    print(f"\n🎉 모든 파이프라인이 정상 종료되었습니다!")
+    print(f"\n🎉 파이프라인이 정상적으로 완료되었습니다!")
 
 
 if __name__ == "__main__":
