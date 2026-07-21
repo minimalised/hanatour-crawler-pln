@@ -11,7 +11,7 @@ from openai import AsyncOpenAI
 # OpenAI 및 구글 시트 기본 설정
 openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", "YOUR_LOCAL_API_KEY"))
 
-SOURCE_SPREADSHEET_ID = os.environ.get("SOURCE_SPREADSHEET_ID", "1mH51VHs4y0FgClkUBvZgw7oY3Yv7gQBA_a3um9uhX0I")
+SOURCE_SPREADSHEET_ID = os.environ.get("SOURCE_SPREADSHEET_ID")
 TARGET_SPREADSHEET_ID = os.environ.get("TARGET_SPREADSHEET_ID")
 
 CONCEPTS = ['A', 'B', 'C', 'D', 'E']
