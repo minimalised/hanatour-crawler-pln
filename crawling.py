@@ -17,7 +17,8 @@ TARGET_SPREADSHEET_ID = os.environ.get("TARGET_SPREADSHEET_ID")
 CONCEPTS = ['A', 'B', 'C', 'D', 'E']
 NUMS = [1]
 TITLE_COLUMNS = [f"{c}_{n}" for c in CONCEPTS for n in NUMS]  # A_1 ~ E_1 총 5개
-BASE_COLUMNS = ["ID", "상품명", "가격", "URL", "이미지URL", "지역", "출발공항"]
+# 모바일URL 추가 (총 8개 기본 컬럼)
+BASE_COLUMNS = ["ID", "상품명", "가격", "URL", "모바일URL", "이미지URL", "지역", "출발공항"]
 COLUMN_ORDER = BASE_COLUMNS + TITLE_COLUMNS
 
 LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "4"))
@@ -156,12 +157,17 @@ async def run_pipeline():
     target_rows = doc.worksheet("상품리스트").get_all_values()[1:]
     target_tasks = []
     for r in target_rows:
-        if r and r[0].startswith("http"):
-            raw_airport = r[2].strip() if len(r) > 2 else ""
+        if r and len(r) > 0 and r[0].startswith("http"):
+            crawling_url = r[0].strip()
+            mobile_url = r[1].strip() if len(r) > 1 else ""
+            region_val = r[2].strip() if len(r) > 2 else ""
+            raw_airport = r[3].strip() if len(r) > 3 else ""
             airport_val = raw_airport if raw_airport != "" else "없음"
+
             target_tasks.append({
-                "url": r[0].strip(),
-                "region": r[1].strip(),
+                "url": crawling_url,
+                "mobile_url": mobile_url,
+                "region": region_val,
                 "airport": airport_val
             })
 
@@ -220,6 +226,7 @@ async def run_pipeline():
                             "상품명": full_title,
                             "가격": price,
                             "URL": task['url'],
+                            "모바일URL": task['mobile_url'],
                             "이미지URL": img_url if img_url else "https://via.placeholder.com/150",
                             "지역": task['region'],
                             "출발공항": task['airport']
@@ -242,7 +249,7 @@ async def run_pipeline():
         df_final[col] = ""
 
     # =================================================================
-    # 3. '저장된상품' 시트 연동 및 캐싱 알고리즘 (안정성 보강)
+    # 3. '저장된상품' 시트 연동 및 캐싱 알고리즘
     # =================================================================
     print("\n💰 [3단계] '저장된상품' 캐시 시트 연동 중...")
     cached_sheet_name = "저장된상품"
@@ -265,7 +272,7 @@ async def run_pipeline():
                 if len(cached_values) > 1:
                     df_cached = pd.DataFrame(cached_values[1:], columns=cached_values[0])
 
-            # 기존 캐시 데이터가 존재하면 ID 기준으로 카피 복사
+            # 기존 캐시 데이터가 존재하면 ID 기준으로 LLM 타이틀 복사
             if not df_cached.empty and all(col in df_cached.columns for col in ["ID"] + TITLE_COLUMNS):
                 df_cache_map = df_cached[["ID"] + TITLE_COLUMNS].drop_duplicates(subset=["ID"])
                 valid_cache = df_cache_map[df_cache_map["A_1"].str.strip() != ""]
@@ -309,13 +316,12 @@ async def run_pipeline():
                 df_final.at[idx, col] = res.get(col, "").strip()
 
     # =================================================================
-    # 5. '저장된상품' 시트에 전체 마스터 누적 및 업데이트 (강력 보장 방식)
+    # 5. '저장된상품' 시트에 전체 마스터 누적 및 업데이트
     # =================================================================
     if TARGET_SPREADSHEET_ID and cached_ws:
         try:
             print(f"\n💾 [4단계] [{cached_sheet_name}] 시트에 누적 업데이트 중...")
             
-            # 기존 캐시와 현재 수집된 데이터를 합쳐 중복 제거한 최신 마스터 생성
             df_final_to_cache = df_final.reindex(columns=COLUMN_ORDER, fill_value="")
             
             if not df_cached.empty and all(col in df_cached.columns for col in COLUMN_ORDER):
@@ -324,7 +330,6 @@ async def run_pipeline():
             else:
                 df_combined = df_final_to_cache
 
-            # A1부터 깔끔하게 전체 업데이트
             all_cache_data = [COLUMN_ORDER] + df_combined.values.tolist()
             cached_ws.clear()
             cached_ws.update(values=all_cache_data, range_name='A1')
